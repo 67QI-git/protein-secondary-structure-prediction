@@ -14,3 +14,4 @@ Function:
 2. Run `ESM_one-hot.py` to convert `.ss` files into `.feat` feature files.
 3. Run `train.py` to train the model on the generated `.feat` files.
 
+![Training pipeline](workflow.png)
