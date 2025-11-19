@@ -7,3 +7,10 @@ Requirements:
 - python 3.6
 - pytorch 1.4.0
 - smile `pip install smile`
+
+Function:
+
+1. Prepare secondary structure `.ss` files.
+2. Run `ESM_one-hot.py` to convert `.ss` files into `.feat` feature files.
+3. Run `train.py` to train the model on the generated `.feat` files.
+
