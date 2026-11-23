@@ -1,460 +1,226 @@
-import torch
-import torch.nn as nn
-from torchcrf import CRF
-import torch.utils.data as Data
-import torch.nn.functional as F
-
-from torch.autograd import Variable
-import torch.utils.data as data
-import configparser
+import argparse
 import os
-import numpy as np
-import random
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-import model_condgated_cbe_aspp
-import valid
+import torch
+from torch import nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 
-import loaddata
-import time
-import datetime
-from torch.optim.lr_scheduler import ReduceLROnPlateau, MultiStepLR
-
-import smile as sm
-from smile import flags, logging
-
-# flags.DEFINE_float("lr",0.0001," ")
-# flags.DEFINE_integer("cnn_layer_num",3," ")
-
-flags.DEFINE_string(
-    "data_fpath",
-    r"/root",
-    " ")
-flags.DEFINE_string("train_fname", "train.feat", " ")
-flags.DEFINE_string("valid_fname", "valid.feat", " ")
-flags.DEFINE_string("test_fname", "test.feat", " ")
-flags.DEFINE_string("test_mark", "cb513", " ")
-flags.DEFINE_integer("num_gpus", 2, "number of GPUs to use")
-flags.DEFINE_boolean("load_model", False, " ")
-flags.DEFINE_boolean("reset_optimizer", True, " ")
-flags.DEFINE_boolean("save_acc", True, " ")
-flags.DEFINE_integer("batch_size", 32, " ")
-flags.DEFINE_string("label", "ss", "ss/rsa")
+from loaddata import ADAPTED_FEATURE_SIZE, MAX_LENGTH, PAD_LABEL, FeatureDataset
+from model_condgated_cbe_aspp import GatedCBEASPP
+from valid import evaluate
 
 
-flags.DEFINE_string("model_path", "models/", " ")
-flags.DEFINE_float("lr", 0.0001, " ")
-flags.DEFINE_string("MSlr_milestones", "10,30", " ")
-flags.DEFINE_string("activationFunc", "default", "logsigmoid/sigmoid/tanh/none")
-flags.DEFINE_integer("num_epochs", 100, " ")
-
-flags.DEFINE_integer("fc_hidden_size", 800, " ")
-
-flags.DEFINE_integer("lstm_hidden_size", 512, " ")
-flags.DEFINE_integer("blstm_layer_num", 2, " ")
-flags.DEFINE_float("lstm_dropout_rate", 0.0, "0.5")  # aclstm
-flags.DEFINE_float("fc1_dropout_rate", 0.0, "0.4")  # aclstm
-
-flags.DEFINE_float("fc0_dropout_rate", 0.0, "0.5")  # aclstm
-
-flags.DEFINE_string("lr_sche", "RlrOP", "MSlr/RlrOP")
-
-# flags.DEFINE_boolean("save_step",False," ")
-
-flags.DEFINE_string("loss_function", "cel", "cel(CrossEntropyLoss)/crf")
-flags.DEFINE_string(
-    "model", "condgatedcbeaspp",
-    "gatedcnn/dl/cnnaspp/lstmaspp/lstm/aclstm/aclstmaspp/aclstmaspp02/informer/condgatedcbeaspp")
-
-flags.DEFINE_boolean("resnet", True, " ")
-flags.DEFINE_boolean("conv_end", True, " ")
-
-flags.DEFINE_float("dropout", 0.0, "0.5")
-flags.DEFINE_integer("n_layers", 64, " ")
-flags.DEFINE_integer("kernel_width", 3, " ")
-flags.DEFINE_integer("out_channel", 64, " ")
-flags.DEFINE_integer("res_block_cnt", 2, " ")
-flags.DEFINE_float("cond_dropout_rate", 0.2, "0.0, 0.2")
+def boolean(value):
+    value = value.lower()
+    if value in ('1', 'true', 'yes'):
+        return True
+    if value in ('0', 'false', 'no'):
+        return False
+    raise argparse.ArgumentTypeError('Expected a boolean value.')
 
 
-flags.DEFINE_integer("d_model", 256, " ")
-flags.DEFINE_integer("e_layers", 3, " ")
-flags.DEFINE_integer("n_heads", 8, " ")
-flags.DEFINE_string("attn", "reg", "prob/reg")
-
-flags.DEFINE_integer("cnn_layer_num", 3, " ")
-flags.DEFINE_integer("bot_layer_num", 1, " ")
-flags.DEFINE_string("window_size_list", "1,3,3,3", "")
-flags.DEFINE_string("dilation_list", "1,2,4,8", "")
-flags.DEFINE_float("output_dropout_rate", 0.0, "0.0, 0.2")
-flags.DEFINE_string("output_layer", "conv1", "conv1/convtop/fc")
-flags.DEFINE_string("mid_layer", "fc", "conv1/fc")
-
-flags.DEFINE_integer("node_size", 100, " ")
-
-FLAGS = flags.FLAGS
+def csv_ints(value):
+    try:
+        return tuple(int(item) for item in value.split(','))
+    except ValueError:
+        raise argparse.ArgumentTypeError('Expected comma-separated integers.')
 
 
-class Config:
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description='Train and evaluate ESM-RASP on Q8 labels.')
+    parser.add_argument('--data_fpath', type=Path, default='/root')
+    parser.add_argument('--train_fname', default='train.feat')
+    parser.add_argument('--valid_fname', default='valid.feat')
+    parser.add_argument('--test_fname', default='test.feat',
+                        help='Comma-separated benchmark files. Use an empty string for training only.')
+    parser.add_argument('--test_mark', default='cb513', help='Benchmark names, in file order.')
+    parser.add_argument('--model_path', type=Path, default='models')
+    parser.add_argument('--load_model', type=boolean, nargs='?', const=True, default=False)
+    parser.add_argument('--reset_optimizer', type=boolean, nargs='?', const=True, default=True)
+    parser.add_argument('--save_acc', type=boolean, nargs='?', const=True, default=True)
+    parser.add_argument('--device', choices=('auto', 'cuda', 'cpu'), default='auto')
+    parser.add_argument('--num_gpus', type=int, default=2)
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--out_channel', type=int, default=64)
+    parser.add_argument('--lstm_hidden_size', type=int, default=512)
+    parser.add_argument('--blstm_layer_num', type=int, default=2)
+    parser.add_argument('--bigru_layer_num', type=int, default=3)
+    parser.add_argument('--lstm_dropout_rate', type=float, default=0.0)
+    parser.add_argument('--output_dropout_rate', type=float, default=0.0)
+    parser.add_argument('--window_size_list', type=csv_ints, default=(1, 3, 3, 3))
+    parser.add_argument('--dilation_list', type=csv_ints, default=(1, 2, 4, 8))
+    parser.add_argument('--ablation', choices=('none', 'bigru', 'bilstm', 'aspp'), default='none')
+    parser.add_argument('--model', choices=('condgatedcbeaspp',), default='condgatedcbeaspp')
+    parser.add_argument('--label', choices=('ss',), default='ss')
+    parser.add_argument('--loss_function', choices=('cel',), default='cel')
+    parser.add_argument('--lr_sche', choices=('RlrOP',), default='RlrOP')
+    config = parser.parse_args(argv)
+    if min(config.batch_size, config.num_epochs, config.out_channel, config.lstm_hidden_size,
+           config.blstm_layer_num, config.bigru_layer_num) < 1:
+        parser.error('Batch size, epoch count, and recurrent sizes must be positive.')
+    if min(config.num_gpus, config.num_workers) < 0:
+        parser.error('GPU and worker counts must be nonnegative.')
+    config.test_fname_list = [name.strip() for name in config.test_fname.split(',')] if config.test_fname else []
+    config.test_mark_list = [name.strip() for name in config.test_mark.split(',')] if config.test_fname_list else []
+    if len(config.test_fname_list) != len(config.test_mark_list):
+        parser.error('--test_fname and --test_mark must have the same number of entries.')
+    if any(not name for name in config.test_fname_list):
+        parser.error('--test_fname must contain nonempty filenames.')
+    if any(not mark or Path(mark).name != mark or mark == '..' for mark in config.test_mark_list):
+        parser.error('--test_mark must contain benchmark names.')
+    if len(set(config.test_mark_list)) != len(config.test_mark_list):
+        parser.error('--test_mark must contain distinct benchmark names.')
+    config.data_max_text_len = MAX_LENGTH
+    config.feature_size = ADAPTED_FEATURE_SIZE
+    config.class_num = PAD_LABEL + 1
+    return config
 
 
-    data_fpath = FLAGS.data_fpath
-    train_fname = FLAGS.train_fname
-    valid_fname = FLAGS.valid_fname
-    test_fname_list = FLAGS.test_fname
-
-    test_fname_list = test_fname_list.split(',')
-
-    train_fpath = os.path.join(data_fpath, train_fname)
-    valid_fpath = os.path.join(data_fpath, valid_fname)
-    test_fpath_list = [(os.path.join(FLAGS.data_fpath, fname)) for fname in test_fname_list]
-
-    test_mark_list = FLAGS.test_mark
-    test_mark_list = test_mark_list.split(',')
-
-    load_model = FLAGS.load_model
-    reset_optimizer = FLAGS.reset_optimizer
-
-    save_acc = FLAGS.save_acc
-    save_acc_fpath = FLAGS.model_path
+def get_device(config):
+    cuda_available = torch.cuda.is_available() and config.num_gpus > 0
+    if config.device == 'cuda' and not cuda_available:
+        raise RuntimeError('CUDA requires an available GPU and --num_gpus greater than zero.')
+    if config.device == 'cpu' or not cuda_available:
+        return torch.device('cpu'), []
+    return torch.device('cuda'), list(range(min(config.num_gpus, torch.cuda.device_count())))
 
 
-
-    device = 'cuda'
-    # tmp_w_size = 11
-
-    dropout_rate = 0.0
-    output_dropout_rate = FLAGS.output_dropout_rate
-    # embedding_size = 256
-    feature_size = 42
-    node_size = FLAGS.node_size
-    data_max_text_len = 700
-    cnn_layer_num = FLAGS.cnn_layer_num
-
-    # bot_window_size = tmp_w_size
-    # window_sizes = [tmp_w_size] * int(cnn_layer_num - 2)
-    top_window_size = tmp_w_size
-    is_train = True
-    batch_size = FLAGS.batch_size
-
-    lstm_hidden_size = FLAGS.lstm_hidden_size
-    blstm_layer_num = FLAGS.blstm_layer_num
-    lstm_dropout_rate = FLAGS.lstm_dropout_rate
-    fc1_dropout_rate = FLAGS.fc1_dropout_rate
-
-    fc0_dropout_rate = FLAGS.fc0_dropout_rate
-
-    model = FLAGS.model
-    activationFunc = FLAGS.activationFunc
-    loss_function = FLAGS.loss_function
-
-    model_path = FLAGS.model_path
-    if FLAGS.model_path[-1] == '/':
-        log_path = '{}.log'.format(FLAGS.model_path[:-1])
-    else:
-        log_path = '{}.log'.format(FLAGS.model_path)
-
-    if FLAGS.label == 'ss':
-        class_num = 9
-    # elif FLAGS.label == 'rsa':
-    #     class_num = 4
-    lr = FLAGS.lr
-    weight_decay = 1e-5
-    min_lr = 0.000000001
-    num_epochs = FLAGS.num_epochs
-    lr_sche = FLAGS.lr_sche
-    num_gpus = FLAGS.num_gpus
-
-    MSlr_milestones = [int(i) for i in FLAGS.MSlr_milestones.split(',')]
-
-    step_jump_output = 5
-
-    # fc:
-    # hidden_size = FLAGS.fc_hidden_size
-    # window_size = 10
+def save_checkpoint(state, path):
+    with NamedTemporaryFile(dir=path.parent, prefix=path.name, delete=False) as temp:
+        temp_path = Path(temp.name)
+    try:
+        torch.save(state, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
-    output_layer = FLAGS.output_layer
+def train_epoch(model, loader, optimizer, loss_fn, device):
+    model.train()
+    total_loss = correct = residue_count = 0
+    for features, labels in loader:
+        features = features.transpose(1, 2).to(device)
+        labels = labels.to(device)
+        valid = labels.ne(PAD_LABEL)
+        optimizer.zero_grad()
+        logits = model(features, valid)
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        optimizer.step()
 
-    dilation_list = [int(i) for i in FLAGS.dilation_list.split(',')]
-    window_size_list = [int(i) for i in FLAGS.window_size_list.split(',')]
+        predictions = logits.detach()[:, :PAD_LABEL].argmax(dim=1)
+        length = valid.sum().item()
+        total_loss += loss.item() * length
+        residue_count += length
+        correct += (predictions.eq(labels) & valid).sum().item()
+    return total_loss / residue_count, correct / residue_count
 
-    if model == 'condgatedcbeaspp':
-        # data config
-        MAX_SENT = 100
-        embed_dim = 42
-        vocab_size = 9
 
-        #GCNN config
-        n_layers = FLAGS.n_layers
-        kernel_width = FLAGS.kernel_width
-        out_channel = FLAGS.out_channel
-        res_block_cnt = FLAGS.res_block_cnt 
-        dropout = FLAGS.dropout
+def main(argv=None):
+    config = parse_args(argv)
+    device, device_ids = get_device(config)
+    print('Using device: {}'.format(device))
+    torch.manual_seed(config.seed)
+    train_data = FeatureDataset(config.data_fpath / config.train_fname, config)
+    valid_data = FeatureDataset(config.data_fpath / config.valid_fname, config)
+    test_data = [
+        FeatureDataset(config.data_fpath / filename, config)
+        for filename in config.test_fname_list
+    ]
+    if any(dataset.feature_size != train_data.feature_size for dataset in [valid_data] + test_data):
+        raise ValueError('Training, validation and benchmark files must use the same feature format.')
 
-        conv_end = FLAGS.conv_end
-        resnet = FLAGS.resnet
+    train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True,
+                              num_workers=config.num_workers)
+    valid_loader = DataLoader(valid_data, batch_size=1, num_workers=config.num_workers)
+    test_loaders = [
+        DataLoader(dataset, batch_size=1, num_workers=config.num_workers)
+        for dataset in test_data
+    ]
 
-        cond_dropout_rate = FLAGS.cond_dropout_rate
+    predictor = GatedCBEASPP(out_channel=config.out_channel, config=config).to(device)
+    model = nn.DataParallel(predictor, device_ids=device_ids) if len(device_ids) > 1 else predictor
+    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_LABEL)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, betas=(0.9, 0.999),
+                                 weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.1, min_lr=1e-9)
+    config.model_path.mkdir(parents=True, exist_ok=True)
+    last_path = config.model_path / 'Epoch_last.ckpt'
+    start_epoch = 0
+    best_epoch = 0
+    best_q8 = -1.0
+    if config.load_model:
+        checkpoint = torch.load(last_path, map_location=device)
+        if 'feature_size' not in checkpoint:
+            raise ValueError('The checkpoint is incompatible with the ESM-RASP model.')
+        if checkpoint.get('feature_size') != train_data.feature_size:
+            raise ValueError('The checkpoint and training file must use the same feature format.')
+        if checkpoint['ablation'] != config.ablation:
+            raise ValueError('The checkpoint and run must use the same ablation.')
+        predictor.load_state_dict(checkpoint['model'])
+        if not config.reset_optimizer:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_epoch = checkpoint['best_epoch']
+        best_q8 = checkpoint['best_q8']
+        del checkpoint
 
-    
+    model_directory = config.model_path.resolve()
+    log_path = model_directory.with_name(model_directory.name + '.log')
+    with log_path.open('a' if config.load_model else 'w', encoding='utf-8') as log:
+        for epoch in range(start_epoch, config.num_epochs):
+            torch.manual_seed(config.seed + epoch)
+            loss, train_q8 = train_epoch(model, train_loader, optimizer, loss_fn, device)
+            results = evaluate(model, valid_loader, device)
+            scheduler.step(results.q8)
+            if results.q8 > best_q8:
+                best_epoch, best_q8 = epoch + 1, results.q8
+
+            summary = (
+                'Epoch [{}/{}], Loss: {:.5f}, train_Q8: {:.5f}, valid_Q8: {:.5f}, '
+                'valid_Q3: {:.5f}, best_epoch: {}'
+            ).format(epoch + 1, config.num_epochs, loss, train_q8, results.q8, results.q3, best_epoch)
+            print(summary)
+            print(summary, file=log, flush=True)
+            state = {
+                'model': predictor.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': scheduler.state_dict(),
+                'feature_size': train_data.feature_size,
+                'ablation': config.ablation,
+                'epoch': epoch,
+                'best_epoch': best_epoch,
+                'best_q8': best_q8,
+            }
+            save_checkpoint(state, config.model_path / 'Epoch{}.ckpt'.format(epoch + 1))
+            save_checkpoint(state, last_path)
+
+        if test_loaders:
+            best_path = config.model_path / 'Epoch{}.ckpt'.format(best_epoch)
+            predictor.load_state_dict(torch.load(best_path, map_location='cpu')['model'])
+            for loader, mark in zip(test_loaders, config.test_mark_list):
+                save_path = None
+                if config.save_acc:
+                    filename = 'acc_{}_Epoch{}_{}.acc'.format(mark, best_epoch, config.model)
+                    save_path = config.model_path / filename
+                results = evaluate(model, loader, device, save_path)
+                summary = ('{} Epoch {}, Q8: {:.5f}, Q3: {:.5f}, '
+                           'protein_Q8: {:.5f} ± {:.5f}, edge_Q8: {:.5f}').format(
+                    mark, best_epoch, results.q8, results.q3, results.protein_q8,
+                    results.protein_q8_std, results.edge_q8
+                )
+                print(summary)
+                print(summary, file=log, flush=True)
 
 
 if __name__ == '__main__':
-    start = datetime.datetime.now()
-
-    config = Config()
-    print("Model Structure Parameter: ", Config.__dict__)
-    print('================================')
-    start = datetime.datetime.now()
-    write_log = open(config.log_path, 'w')
-
-    write_log.write("Model Structure Parameter: ")
-    for key in Config.__dict__:
-        write_log.write('{}:{}, '.format(key, Config.__dict__[key]))
-    # write_log.write(Config.__dict__)
-    write_log.write('\n')
-    write_log.write('================================\n')
-    write_log.flush()
-
-
-
-
-    def read_data(path):
-        feature_list = []
-        label_list = []
-        with open(path) as f:
-            feature_tmp = []
-            label_tmp = []
-            for index, line in enumerate(f):
-                ll = line.split(' ')
-                if len(ll) > 1:
-                    ll = list(map(float, ll[:-1]))
-                    if len(ll) != 44:
-                        raise selfException(
-                            "the length of ll is not {}".format(44))
-                    feature_tmp.append(ll)
-                elif (int(float(ll[0].strip())) < 9):
-                    label_tmp.append(int(float(ll[0].strip())))
-                if len(feature_tmp) == config.data_max_text_len:
-                    feature_list.append(feature_tmp)
-                    feature_tmp = []
-                if len(label_tmp) == config.data_max_text_len:
-                    label_list.append(label_tmp)
-                    label_tmp = []
-            randnum = random.randint(0, 100)
-            random.seed(randnum)
-            random.shuffle(feature_list)
-            random.seed(randnum)
-            random.shuffle(label_list)
-            print('shuffled random seed: {}'.format(randnum))
-        return feature_list, label_list
-
-
-    # read data
-    train_data, train_label = loaddata.read_data(
-        config.train_fpath, config, shuffle=True)
-    train_data = train_data.permute(0, 2, 1)
-    valid_data, valid_label = loaddata.read_data(
-        config.valid_fpath, config, shuffle=False)
-    valid_data = valid_data.permute(0, 2, 1)
-
-    test_data_list = []
-    test_label_list = []
-    for test_path in config.test_fpath_list:
-        test_data, test_label = loaddata.read_data(
-            test_path, config, shuffle=False)
-        test_data = test_data.permute(0, 2, 1)
-        test_data_list.append(test_data)
-        test_label_list.append(test_label)
-
-
-    print('train_data_size', train_data.size())
-    print('train_label_size', train_label.size())
-
-    if config.model == 'condgatedcbeaspp':
-        CNNCRFModel = model_condgated_cbe_aspp.GatedCBEASPP(
-            config.vocab_size,
-            config.embed_dim,
-            config.kernel_width,
-            config.out_channel,
-            config.n_layers,
-            config.res_block_cnt,
-            config.activationFunc,
-            config,
-            dropout=config.dropout)
-
-        
-    print(CNNCRFModel)
-
-    if torch.cuda.is_available():
-        print('cuda is available')
-        # 根据 flags.num_gpus 使用多卡并行训练（保持原有打印不变）
-        device_ids = list(range(config.num_gpus)) if config.num_gpus > 0 else []
-        CNNCRFModel = CNNCRFModel.cuda()
-        if len(device_ids) > 1:
-            CNNCRFModel = nn.DataParallel(CNNCRFModel, device_ids=device_ids)
-        crf = CRF(config.class_num, batch_first=True).cuda()
-        # crf = nn.DataParallel(crf)
-
-    # loss_func = nn.CrossEntropyLoss()
-    if config.class_num == 9:
-        loss_func = nn.CrossEntropyLoss(ignore_index=8)
-    elif config.class_num == 4:
-        loss_func = nn.CrossEntropyLoss(ignore_index=3)
-
-    torch_dataset = Data.TensorDataset(train_data, train_label)
-    # put dataset in DataLoader
-    loader = Data.DataLoader(
-        dataset=torch_dataset,  # torch TensorDataset format
-        batch_size=config.batch_size,  # mini batch size
-        shuffle=True,
-        num_workers=2,
-    )
-
-    valid_torch_dataset = Data.TensorDataset(valid_data, valid_label)
-    valid_loader = Data.DataLoader(
-        dataset=valid_torch_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=2,
-    )
-    test_loader_list = []
-    for test_data, test_label in zip(test_data_list, test_label_list):
-        test_torch_dataset = Data.TensorDataset(test_data, test_label)
-        test_loader = Data.DataLoader(
-            dataset=test_torch_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=2,
-        )
-        test_loader_list.append(test_loader)
-
-
-    optimizer = torch.optim.Adam(
-        CNNCRFModel.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-
-    if FLAGS.lr_sche == 'RlrOP':
-        lr_scheduler = ReduceLROnPlateau(
-            optimizer,
-            mode='max',
-            patience=3,
-            factor=0.1,
-            min_lr=config.min_lr,
-            verbose=True)
-    elif config.lr_sche == 'MSlr':
-        lr_scheduler = MultiStepLR(optimizer, config.MSlr_milestones)
-
-
-    def acc(pred_list, label_list):
-        total = 0
-        good = 0
-        for pred_sub, label_sub in zip(pred_list, label_list):
-            for p, l in zip(pred_sub, label_sub):
-                if l != torch.tensor(config.class_num-1).to('cuda'):
-                    if p == l:
-                        good += 1
-                    total += 1
-        return good / total
-
-
-    def tr_va_acc(outputs, label, acc_1):
-        prediction = torch.argmax(outputs, 1)
-        acc_1 += acc(prediction, label)
-        # acc_1 = acc_1 / (step+1)
-        return acc_1
-
-    start_epoch = 0
-    if os.path.exists(os.path.join(config.model_path, 'Epoch_last.ckpt')) and config.load_model:
-        checkpoint = torch.load(os.path.join(config.model_path, 'Epoch_last.ckpt'))
-        # 兼容 DataParallel 与单卡的加载
-        if hasattr(CNNCRFModel, 'module'):
-            CNNCRFModel.module.load_state_dict(checkpoint['model'])
-        else:
-            CNNCRFModel.load_state_dict(checkpoint['model'])
-        if not config.reset_optimizer:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        start_epoch = checkpoint['epoch'] + 1
-
-    best_epoch = 0
-    best_valid_acc = 0
-    for epoch in range(start_epoch, config.num_epochs):
-        CNNCRFModel.train()
-        acc_1 = 0
-        tt_1 = 0
-        loss_epoch_sum = 0
-
-
-        for step, (batch_x, batch_y) in enumerate(loader):
-            # start training
-            optimizer.zero_grad()
-            outputs = CNNCRFModel(batch_x.to('cuda'))
-
-
-            # if config.loss_function == 'crf':
-            #     outputs = outputs.permute(0, 2, 1)
-            #     mask = (batch_y.to('cuda') != 8).long().to(torch.uint8)
-            #     loss = -crf(outputs, batch_y.to('cuda'), mask=mask)
-            #     outputs_acc = outputs.permute(0, 2, 1)
-            if config.loss_function == 'cel':
-                loss = loss_func(outputs, batch_y.to('cuda'))
-                outputs_acc = outputs
-
-            loss.backward()
-            optimizer.step()
-            loss_epoch_sum += loss
-
-            acc_1 = tr_va_acc(outputs_acc, batch_y.to('cuda'), acc_1)
-            tt_1 += 1
-
-     
-        if not os.path.exists(config.model_path):
-            os.makedirs(config.model_path)
-
-        loss_avg = loss_epoch_sum / (step+1)
-        print_line = 'Epoch [{}/{}], Loss: {:.5f}, train_acc: {:.5f}, '.format(epoch + 1, config.num_epochs, loss_avg, acc_1 / tt_1)
-
-        CNNCRFModel.eval()
-        valid_acc, valid_edge_acc, valid_std, valid_edge_std = valid.get_valid_acc(config, CNNCRFModel, valid_loader, epoch, test_mark='valid', save_acc=False)
-        
-        # 根据学习率调度器类型传入不同参数
-        if config.lr_sche == 'RlrOP':
-            lr_scheduler.step(valid_acc)  # ReduceLROnPlateau需要监控指标
-        else:
-            lr_scheduler.step()  # MultiStepLR不需要参数
-        print_line += 'valid_acc: {:.5f} ± {:.5f}, '.format(valid_acc, valid_std)
-
-        if valid_acc > best_valid_acc:
-            best_valid_acc = valid_acc
-            best_epoch = epoch + 1
-
-
-        test_acc_list = []
-        for test_loader, test_mark in zip(test_loader_list, config.test_mark_list):
-            test_acc, test_edge_acc, test_std, test_edge_std = valid.get_valid_acc(config, CNNCRFModel, test_loader, epoch, test_mark=test_mark, save_acc=config.save_acc)
-            print_line += '{}_acc: {:.5f} ± {:.5f}, '.format(test_mark, test_acc, test_std)
-            print_line += '{}_edge_acc: {:.5f} ± {:.5f}, '.format(test_mark, test_edge_acc, test_edge_std)
-            test_acc_list.append(test_acc)
-
-        end = datetime.datetime.now()
-        print_line += 'be: {}, time: {}'.format(best_epoch, end-start)
-        print(print_line)
-        write_log.write(print_line)
-        write_log.write('\n')
-        write_log.flush()
-
-
-
-        # 保存时始终保存真实模型参数，避免 DataParallel 前缀导致的兼容问题
-        state = {'model': (CNNCRFModel.module.state_dict() if hasattr(CNNCRFModel, 'module') else CNNCRFModel.state_dict()),
-                 'optimizer': optimizer.state_dict(),
-                 'lr_scheduler': lr_scheduler.state_dict(),
-                 'epoch': epoch}
-
-        save_dpath = os.path.join(
-            config.model_path, 'Epoch{}.ckpt'.format(epoch + 1))
-        save_last_dpath = os.path.join(config.model_path, 'Epoch_last.ckpt')
-        torch.save(state, save_dpath)
-        torch.save(state, save_last_dpath)
-
-
+    main()

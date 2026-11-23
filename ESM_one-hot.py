@@ -1,138 +1,166 @@
+import argparse
 import os
-import torch
-import torch.nn as nn
-import esm
+from pathlib import Path
+import subprocess
+from tempfile import NamedTemporaryFile
+
 import numpy as np
-import math
+import torch
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+from loaddata import AA_ALPHABET, ESM_DIM, MAX_LENGTH, Q8_STATES
 
-# ESM model
-model, alphabet = esm.pretrained.esm2_t36_3B_UR50D()
-model = model.to(device).eval()
-batch_converter = alphabet.get_batch_converter()
 
-# One-hot encoding
-valid_aa = ['A', 'C', 'E', 'D', 'G', 'F', 'I', 'H', 'K', 'M',
-            'L', 'N', 'Q', 'P', 'S', 'R', 'T', 'W', 'V', 'Y', 'X']
-valid_dict = {k: i for i, k in enumerate(valid_aa)}
-def encode_one_hot(seq):
-    idxs = [valid_dict.get(res, valid_dict['X']) for res in seq]
-    return np.eye(len(valid_aa))[idxs]  #(L, 21)
+AA_INDEX = {residue: index for index, residue in enumerate(AA_ALPHABET)}
+Q8_INDEX = {state: index for index, state in enumerate(Q8_STATES)}
+COIL_ALIASES = {' ': 'C', '-': 'C', 'L': 'C', 'P': 'C'}
+ESM_LAYER = 36
 
-# Secondary structure labels
-ss_list = ['C', 'B', 'E', 'G', 'I', 'H', 'S', 'T', ' ']
-ss_index_dict = {ss: idx for idx, ss in enumerate(ss_list)}
 
-# Read labels
-ss_path = r"/root/sequence.ss"
-ss_dict = {}
-with open(ss_path, "r") as f:
-    for line in f:
-        if ',' not in line:
+def normalize_sequence(sequence):
+    uppercase_residues = (residue.upper() for residue in sequence)
+    return ''.join(residue if residue in AA_INDEX else 'X' for residue in uppercase_residues)
+
+
+def encode_one_hot(sequence):
+    indices = [AA_INDEX.get(residue, AA_INDEX['X']) for residue in sequence]
+    return np.eye(len(AA_ALPHABET), dtype=np.float32)[indices]
+
+
+def read_ss(path):
+    with open(path, encoding='utf-8-sig') as source:
+        for line_number, line in enumerate(source, 1):
+            line = line.rstrip('\r\n')
+            if not line.strip():
+                continue
+            sequence, comma, states = line.partition(',')
+            if not comma:
+                raise ValueError('{}:{}: expected a sequence and comma-separated DSSP states'.format(
+                    path, line_number
+                ))
+            yield sequence.strip(), states, '{}:{}'.format(path, line_number)
+
+
+def read_dssp(path, executable):
+    result = subprocess.run(
+        [executable, '--output-format=dssp', str(path)],
+        check=True, stdout=subprocess.PIPE, universal_newlines=True
+    )
+
+    chains = {}
+    in_residues = False
+    for line in result.stdout.splitlines():
+        if not in_residues:
+            in_residues = line.split()[:2] == ['#', 'RESIDUE']
             continue
-        seq, ss = line.strip().split(',')
-        ss_dict[seq] = ss
+        if not line.strip():
+            continue
+        if len(line) < 17:
+            raise ValueError('{}: invalid DSSP residue record'.format(path))
+        if line[9] == ' ' or line[13] == '!':
+            continue
+        residues, states = chains.setdefault(line[11], ([], []))
+        residue = line[13]
+        # DSSP denotes disulfide-bonded cysteines with lowercase bridge IDs.
+        residues.append('C' if residue.islower() else residue)
+        states.append(line[16])
+
+    if not chains:
+        raise ValueError('{}: no DSSP-annotated chains'.format(path))
+    for chain, (residues, states) in chains.items():
+        yield ''.join(residues), ''.join(states), '{} chain {!r}'.format(path, chain)
 
 
-# Transformer encoder
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=1000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer('pe', pe)
+def prepare_chains(records):
+    seen = set()
+    for sequence, states, identifier in records:
+        sequence = normalize_sequence(sequence)
+        if not sequence or len(sequence) != len(states):
+            raise ValueError('{}: sequence and DSSP states must have the same nonzero length'.format(
+                identifier
+            ))
+        if len(sequence) > MAX_LENGTH:
+            raise ValueError('{}: chain length {} exceeds {}'.format(
+                identifier, len(sequence), MAX_LENGTH
+            ))
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        try:
+            labels = [Q8_INDEX[COIL_ALIASES.get(state, state)] for state in states.upper()]
+        except KeyError as exc:
+            raise ValueError('{}: invalid DSSP state {!r}'.format(identifier, exc.args[0])) from exc
 
-
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, d_model=512, nhead=8, dim_feedforward=2048, dropout=0.1):
-        super(TransformerEncoderBlock, self).__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Linear(dim_feedforward, d_model)
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
-        attn_out, _ = self.attn(x, x, x, attn_mask=mask)
-        x = self.norm1(x + self.dropout(attn_out))
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + self.dropout(ffn_out))
-        return x
+        if sequence not in seen:
+            seen.add(sequence)
+            yield sequence, labels
 
 
-class TransformerEncoder(nn.Module):
-    def __init__(self, num_layers=4, d_model=512, nhead=8, dim_feedforward=2048, dropout=0.1, max_len=1000):
-        super(TransformerEncoder, self).__init__()
-        self.pos_encoder = PositionalEncoding(d_model, max_len)
-        self.layers = nn.ModuleList([
-            TransformerEncoderBlock(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_layers)
-        ])
+def write_features(chains, output, model, batch_converter, device):
+    temp_path = None
+    try:
+        with NamedTemporaryFile(
+            mode='w', encoding='ascii', newline='\n', dir=str(output.parent),
+            prefix=output.name + '.', suffix='.tmp', delete=False
+        ) as handle:
+            temp_path = Path(handle.name)
+            with torch.no_grad():
+                for sequence, labels in chains:
+                    _, _, tokens = batch_converter([('sequence', sequence)])
+                    result = model(tokens.to(device), repr_layers=[ESM_LAYER], return_contacts=False)
+                    embeddings = result['representations'][ESM_LAYER][0, 1:len(sequence) + 1]
+                    if embeddings.shape != (len(sequence), ESM_DIM):
+                        raise ValueError('unexpected ESM residue embedding shape {}'.format(
+                            tuple(embeddings.shape)
+                        ))
 
-    def forward(self, x, mask=None):
-        x = self.pos_encoder(x)
-        for layer in self.layers:
-            x = layer(x, mask)
-        return x
+                    features = np.concatenate((embeddings.float().cpu().numpy(),
+                                               encode_one_hot(sequence)), axis=1)
+                    handle.write('{}\n'.format(len(sequence)))
+                    np.savetxt(handle, features, fmt='%.9g')
+                    handle.writelines('{}\n'.format(label) for label in labels)
+
+        os.replace(str(temp_path), str(output))
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
-# Initialization and Transformer encoder
-project_layer = nn.Linear(2560, 512).to(device)
-transformer_module = TransformerEncoder(num_layers=4, d_model=512).to(device)
+def main():
+    parser = argparse.ArgumentParser(description='Cache frozen ESM-2 embeddings for Q8 training.')
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument('--input', type=Path, default=Path('/root/sequence.ss'),
+                        help='Input .ss file with sequence and DSSP labels')
+    inputs.add_argument('--pdb', nargs='+', type=Path,
+                        help='PDB coordinate files to annotate with mkdssp')
+    parser.add_argument('--dssp-executable', default='mkdssp', help='Path to mkdssp 4 or later')
+    parser.add_argument('--output', type=Path, default=Path('/root/sequence.feat'))
+    parser.add_argument('--device', default='auto', help='auto, cpu, cuda or cuda:N')
+    args = parser.parse_args()
 
-# Output file
-out_path = "/root/sequence.feat"
-with open(out_path, 'w') as w:
-    for seq, ss in ss_dict.items():
-        data = [("seq", seq)]
-        _, _, batch_tokens = batch_converter(data)
-        batch_tokens = batch_tokens.to(device)
+    input_paths = args.pdb or [args.input]
+    if args.output.resolve() in {path.resolve() for path in input_paths}:
+        parser.error('input and output must be different files')
 
-        with torch.no_grad():
-            results = model(batch_tokens, repr_layers=[36], return_contacts=False)
-        rep = results["representations"][36][0, 1:len(seq)+1]  # (L, 2560)
+    if args.pdb:
+        records = (record for path in args.pdb for record in read_dssp(path, args.dssp_executable))
+    else:
+        records = read_ss(args.input)
+    chains = list(prepare_chains(records))
+    if not chains:
+        parser.error('input contains no protein chains')
 
-        # Dimension reduction + Transformer
-        rep_proj = project_layer(rep).unsqueeze(0)  # (1, L, 512)
-        transformer_out = transformer_module(rep_proj).squeeze(0)  # (L, 512)
+    import esm
 
-        # Linear mapping to 21 dimensions
-        head = nn.Linear(512, 21).to(device)
-        with torch.no_grad():
-            pred_feat = head(transformer_out)  #(L, 21)
+    device_name = args.device
+    if device_name == 'auto':
+        device_name = 'cpu'
+        if (torch.cuda.is_available()
+                and torch.cuda.get_device_properties(0).total_memory >= 15 * 1024 ** 3):
+            device_name = 'cuda'
+    device = torch.device(device_name)
+    print('Using device: {}'.format(device))
+    model, alphabet = esm.pretrained.esm2_t36_3B_UR50D()
+    model = model.to(device).eval().requires_grad_(False)
+    write_features(chains, args.output, model, alphabet.get_batch_converter(), device)
 
-        # One-hot concatenation
-        onehot_21d = torch.tensor(encode_one_hot(seq), dtype=torch.float32, device=device)  # (L, 21)
-        combined = torch.cat([pred_feat, onehot_21d], dim=-1)  # (L, 42)
 
-        # Padding to 700 rows
-        combined = combined.detach().cpu().numpy()
-        pad_len = 700 - len(seq)
-        if pad_len > 0:
-            combined = np.pad(combined, ((0, pad_len), (0, 0)), mode='constant')
-
-        # Write feature count
-        w.write("700\n")
-
-        # Write feature vectors
-        for row in combined:
-            w.write(' '.join(map(str, row)) + '\n')
-
-        # Write labels
-        for ch in ss:
-            w.write(f"{ss_index_dict.get(ch, 8)}\n")
-        for _ in range(pad_len):
-            w.write("8\n")
+if __name__ == '__main__':
+    main()

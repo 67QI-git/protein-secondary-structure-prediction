@@ -1,291 +1,186 @@
-from torch.nn.parameter import Parameter
-from torch.nn.modules.utils import _single, _pair, _triple
-from torch.nn.modules.conv import Conv1d
-from torch.nn.modules.conv import _ConvNd
-from torch import nn
 import functools
+import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-# from config import config
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.modules.conv import _ConvNd
+from torch.nn.modules.utils import _pair, _single
+from torch.nn.parameter import Parameter
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+from aspp import ASPP1D
+from loaddata import AA_ALPHABET, ADAPTED_FEATURE_SIZE, ESM_DIM, MAX_LENGTH, PAD_LABEL
+
+
+class ESMAdapter(nn.Module):
+    def __init__(self, hidden_size, layers, heads, dropout, max_length):
+        super().__init__()
+        self.input_projection = nn.Linear(ESM_DIM, hidden_size)
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(hidden_size, heads, hidden_size * 4, dropout)
+            for _ in range(layers)
+        ])
+        self.output_projection = nn.Linear(hidden_size, len(AA_ALPHABET))
+
+        positions = torch.arange(max_length, dtype=torch.float32).unsqueeze(1)
+        frequencies = torch.exp(
+            torch.arange(0, hidden_size, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / hidden_size)
+        )
+        phase = positions * frequencies
+        encoding = torch.zeros(max_length, hidden_size)
+        encoding[:, 0::2] = phase.sin()
+        encoding[:, 1::2] = phase[:, :hidden_size // 2].cos()
+        self.register_buffer('position_encoding', encoding.unsqueeze(1))
+
+    def forward(self, embeddings, valid_mask):
+        length = embeddings.size(1)
+        if length > self.position_encoding.size(0):
+            raise ValueError('The sequence exceeds the adapter maximum length')
+
+        # Attention softmax needs at least one unmasked key per sample.
+        padding_mask = ~valid_mask
+        padding_mask[:, 0] = padding_mask[:, 0] & valid_mask.any(dim=1)
+        hidden = self.input_projection(embeddings).transpose(0, 1)
+        hidden = hidden + self.position_encoding[:length].to(hidden.dtype)
+        for layer in self.layers:
+            hidden = layer(hidden, src_key_padding_mask=padding_mask)
+        return self.output_projection(hidden.transpose(0, 1))
 
 
 class GatedCBEASPP(nn.Module):
-    def __init__(self,
-                 vocab_size,
-                 embed_dim,
-                 kernel_width,
-                 out_channel,
-                 n_layers,
-                 res_block_cnt,
-                 activationFunc,
-                 config,
-                 dropout=0.1):
-        super(GatedCBEASPP, self).__init__()
+    def __init__(
+        self,
+        vocab_size=PAD_LABEL + 1,
+        embed_dim=ADAPTED_FEATURE_SIZE,
+        kernel_width=3,
+        out_channel=64,
+        n_layers=64,
+        res_block_cnt=2,
+        activationFunc='default',
+        config=None,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.class_num = getattr(config, 'class_num', vocab_size)
+        if self.class_num != PAD_LABEL + 1:
+            raise ValueError('The classifier requires eight DSSP states and one pad class')
 
-        aspp_layer_num = len(config.dilation_list)
-        if activationFunc == 'logsigmoid':
-            actFunc = nn.LogSigmoid()
-        elif activationFunc == 'sigmoid':
-            actFunc = nn.Sigmoid()
-        elif activationFunc == 'tanh':
-            actFunc = nn.Tanh()
-        elif activationFunc == 'relu':
-            actFunc = nn.ReLU()
-        elif activationFunc == 'none':
-            actFunc = None
+        ablation = getattr(config, 'ablation', 'none')
+        if ablation not in ('none', 'bigru', 'bilstm', 'aspp'):
+            raise ValueError('ablation must be one of none, bigru, bilstm or aspp')
 
-        self.res_block_cnt = res_block_cnt
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-
-        self.padding_left = nn.ConstantPad1d((kernel_width - 1, 0), 0)
-
-        self.conv_0 = nn.Sequential(CondConv1D(in_channels=embed_dim, out_channels=out_channel,
-                                               kernel_size=kernel_width, stride=1,
-                                               padding=0, dilation=1, num_experts=3, dropout_rate=config.cond_dropout_rate)
-                                    # , actFunc
-                                    )
-        self.b_0 = nn.Parameter(torch.zeros(out_channel, 1))  # same as paper
-        self.conv_gate_0 = nn.Sequential(
-            nn.Conv1d(
-                in_channels=embed_dim,
-                out_channels=out_channel,
-                kernel_size=kernel_width)
-            #  , actFunc
-        )
-        self.c_0 = nn.Parameter(torch.zeros(out_channel, 1))
-
-        self.convs = nn.ModuleList([nn.Sequential(CondConv1D(in_channels=out_channel, out_channels=out_channel,
-                                                             kernel_size=kernel_width, stride=1,
-                                                             padding=0, dilation=1, num_experts=3, dropout_rate=config.cond_dropout_rate)
-                                                  #   , actFunc
-
-                                                  ) for _ in range(n_layers)
-                                    ])
-
-        self.bs = nn.ParameterList([
-            nn.Parameter(torch.zeros(out_channel, 1))  # collections of b
-            for _ in range(n_layers)
-        ])
-
-        self.conv_gates = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(
-                    in_channels=out_channel,
-                    out_channels=out_channel,
-                    kernel_size=kernel_width)
-                #    , actFunc
-            ) for _ in range(n_layers)
-        ])
-
-        self.cs = nn.ParameterList([
-            nn.Parameter(torch.zeros(out_channel, 1)) for _ in range(n_layers)
-        ])
-
-        self.fc = nn.Linear(out_channel, vocab_size)
-        self.dropout = nn.Dropout(p=dropout)  # todo use dropout
-
-        # conv1d Input: (N, Cin, Lin)
-        # constantpad1d Input: (N,C,Win)  Output: (N,C,Wout)
-
-        self.conv_top = nn.Sequential(
-            nn.Conv1d(
-                in_channels=(out_channel + config.lstm_hidden_size * 2) *
-                (aspp_layer_num + 1),
-                out_channels=vocab_size,
-                kernel_size=config.top_window_size,
-                padding=int((config.top_window_size - 1) / 2)),
-            #   nn.BatchNorm1d(num_features=config.class_num),
-            nn.Dropout(config.output_dropout_rate),
-            nn.LogSigmoid()
-            # nn.Sigmoid()
+        self.adapter = ESMAdapter(
+            hidden_size=getattr(config, 'adapter_hidden_size', 512),
+            layers=getattr(config, 'adapter_layers', 4),
+            heads=getattr(config, 'adapter_heads', 8),
+            dropout=getattr(config, 'adapter_dropout', 0.1),
+            max_length=getattr(config, 'data_max_text_len', MAX_LENGTH),
         )
 
-        self.conv_end = config.conv_end
-        self.resnet = config.resnet
+        gru_layers = getattr(config, 'bigru_layer_num', 3)
+        lstm_layers = getattr(config, 'bilstm_layer_num', getattr(config, 'blstm_layer_num', 2))
+        lstm_hidden = getattr(config, 'lstm_hidden_size', 512)
+        recurrent_dropout = getattr(config, 'lstm_dropout_rate', 0.0)
+        fused_channels = out_channel + 2 * lstm_hidden
 
-        # BiLSTM decoder configuration
-        self.bilstm_hidden_size = getattr(
-            config, 'transformer_hidden_size', getattr(config, 'lstm_hidden_size', 512))
-        self.bilstm_num_layers = getattr(
-            config, 'bilstm_layer_num', getattr(config, 'blstm_layer_num', 4))
-        self.bilstm_dropout = getattr(
-            config, 'bilstm_dropout', getattr(config, 'lstm_dropout_rate', 0.1))
-
-        # Input projection: feature_size -> hidden_size
-        self.input_projection = nn.Linear(config.feature_size, self.bilstm_hidden_size)
-
-        # Manually stacked BiLSTM layers (each with num_layers=1, bidirectional=True)
-        self.bilstm_layers = nn.ModuleList()
-        for i in range(self.bilstm_num_layers):
-            input_size = self.bilstm_hidden_size if i == 0 else self.bilstm_hidden_size * 2
-            self.bilstm_layers.append(
-                nn.LSTM(
-                    input_size=input_size,
-                    hidden_size=self.bilstm_hidden_size,
-                    num_layers=1,
-                    batch_first=True,
-                    dropout=0.0,
-                    bidirectional=True,
-                )
+        self.bigru_encoder = None
+        if ablation != 'bigru':
+            self.bigru_encoder = nn.GRU(
+                input_size=ADAPTED_FEATURE_SIZE,
+                hidden_size=out_channel,
+                num_layers=gru_layers,
+                batch_first=True,
+                dropout=recurrent_dropout if gru_layers > 1 else 0.0,
+                bidirectional=True,
             )
+            self.bigru_proj = nn.Linear(2 * out_channel, fused_channels)
 
-        # LayerNorm after each layer
-        self.layer_norms = nn.ModuleList(
-            [nn.LayerNorm(self.bilstm_hidden_size * 2) for _ in range(self.bilstm_num_layers)]
-        )
+        self.bilstm_decoder = None
+        if ablation != 'bilstm':
+            self.bilstm_decoder = nn.LSTM(
+                input_size=ADAPTED_FEATURE_SIZE,
+                hidden_size=lstm_hidden,
+                num_layers=lstm_layers,
+                batch_first=True,
+                dropout=recurrent_dropout if lstm_layers > 1 else 0.0,
+                bidirectional=True,
+            )
+            self.bilstm_proj = nn.Linear(2 * lstm_hidden, fused_channels)
 
-        # Multi-head self-attention (to enhance long-term dependencies)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=self.bilstm_hidden_size * 2,
-            num_heads=8,
-            dropout=self.bilstm_dropout,
-            batch_first=True,
-        )
+        if self.bigru_encoder is not None and self.bilstm_decoder is not None:
+            self.fusion_gate = nn.Linear(2 * fused_channels, fused_channels)
 
-        # Output projection layer
-        self.output_projection = nn.Linear(self.bilstm_hidden_size * 2, self.bilstm_hidden_size * 2)
+        self.aspp = None
+        head_channels = fused_channels
+        if ablation != 'aspp':
+            self.aspp = ASPP1D(
+                fused_channels,
+                dilations=getattr(config, 'dilation_list', (1, 2, 4, 8)),
+                kernel_sizes=getattr(config, 'window_size_list', (1, 3, 3, 3)),
+            )
+            head_channels = self.aspp.out_channels
 
+        self.output_dropout = nn.Dropout(getattr(config, 'output_dropout_rate', dropout))
+        self.classifier = nn.Conv1d(head_channels, self.class_num, kernel_size=1)
 
-        nn.init.xavier_uniform_(self.input_projection.weight)
-        nn.init.zeros_(self.input_projection.bias)
-        nn.init.xavier_uniform_(self.output_projection.weight)
-        nn.init.zeros_(self.output_projection.bias)
-        for lstm in self.bilstm_layers:
-            for name, param in lstm.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias' in name:
-                    param.data.fill_(0.0)
-                    n = param.size(0)
-                    param.data[n // 4:n // 2].fill_(1.0)
+    def _resolve_mask(self, seq, valid_mask):
+        if seq.dim() != 3 or seq.size(0) == 0 or seq.size(2) == 0:
+            raise ValueError('Expected features shaped (batch, channels, residues)')
+        if valid_mask is None:
+            return seq[:, -len(AA_ALPHABET):].ne(0).any(dim=1)
+        if valid_mask.shape != (seq.size(0), seq.size(2)):
+            raise ValueError('The residue mask must have shape (batch, residues)')
+        return valid_mask.to(device=seq.device, dtype=torch.bool)
 
-        # self.fc1 = nn.Sequential(
-        #     nn.Sigmoid(),
-        #     nn.Dropout(config.fc1_dropout_rate),
-        #     # nn.Linear(config.feature_size*2, config.class_num),
-        #     nn.Linear(config.node_size + config.lstm_hidden_size * 2,
-        #               config.class_num),
-        #     nn.ReLU())
-        # # self.fc2 = nn.Sequential(
-        # #     nn.Linear(config.class_num, config.class_num)
-        # #     # ,nn.LogSoftmax(dim=config.class_num)
-        # # )
+    @staticmethod
+    def _recurrent_features(stream, projection, packed, length):
+        packed_output, _ = stream(packed)
+        output, _ = pad_packed_sequence(packed_output, batch_first=True, total_length=length)
+        return projection(output)
 
-        self.convs_aspp = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(
-                    in_channels=out_channel + config.lstm_hidden_size * 2,
-                    out_channels=out_channel + config.lstm_hidden_size * 2,
-                    kernel_size=aspp_window_size,
-                    padding=int((aspp_window_size - 1) / 2 +
-                                (dil - 1) * int((aspp_window_size - 1) / 2)),
-                    # padding=int((config.bot_window_size-1)/2),
-                    dilation=dil),
-                nn.ReLU(),
-                # af,
-                nn.BatchNorm1d(out_channel + config.lstm_hidden_size * 2),
+    def forward(self, seq, valid_mask=None):
+        """Return nine logits per residue, with zeros at padded positions."""
+        valid_mask = self._resolve_mask(seq, valid_mask)
+        input_length = seq.size(2)
+        positions = torch.arange(1, input_length + 1, device=seq.device)
+        lengths = positions.expand_as(valid_mask).masked_fill(~valid_mask, 0).max(dim=1)[0]
+        lengths = lengths.clamp(min=1).cpu()
+        length = int(lengths.max().item())
+        valid_mask = valid_mask[:, :length]
+        pad_mask = ~valid_mask.unsqueeze(2)
+        features = seq[:, :, :length].transpose(1, 2).masked_fill(pad_mask, 0)
 
-                # nn.Sigmoid()
-            ) for dil, aspp_window_size in zip(config.dilation_list,
-                                               config.window_size_list)
-        ])
+        if features.size(2) == ESM_DIM + len(AA_ALPHABET):
+            embeddings = self.adapter(features[:, :, :ESM_DIM], valid_mask)
+            features = torch.cat((embeddings, features[:, :, ESM_DIM:]), dim=2)
+            features = features.masked_fill(pad_mask, 0)
+        elif features.size(2) != ADAPTED_FEATURE_SIZE:
+            raise ValueError('Expected ESM features with appended amino-acid one-hot channels')
 
-        self.conv_1 = nn.Sequential(
-            nn.Conv1d(
-                in_channels=(out_channel + config.lstm_hidden_size * 2) *
-                (aspp_layer_num + 1),
-                out_channels=config.class_num,
-                kernel_size=1),
-            #   nn.BatchNorm1d(num_features=config.node_size),
-            nn.LogSigmoid(),
-            nn.Dropout(config.output_dropout_rate),
-            #   nn.BatchNorm1d(num_features=config.class_num) # after changed
-            # nn.Sigmoid()
-        )
+        packed = pack_padded_sequence(features, lengths, batch_first=True, enforce_sorted=False)
+        if self.bigru_encoder is None:
+            fused = self._recurrent_features(self.bilstm_decoder, self.bilstm_proj, packed, length)
+        elif self.bilstm_decoder is None:
+            fused = self._recurrent_features(self.bigru_encoder, self.bigru_proj, packed, length)
+        else:
+            gru = self._recurrent_features(self.bigru_encoder, self.bigru_proj, packed, length)
+            lstm = self._recurrent_features(self.bilstm_decoder, self.bilstm_proj, packed, length)
+            gate = torch.sigmoid(self.fusion_gate(torch.cat((gru, lstm), dim=2)))
+            fused = gate * gru + (1.0 - gate) * lstm
 
-        self.device = config.device
-        # self.hidden_size = config.feature_size
-        self.lstm_hidden_size = config.lstm_hidden_size 
-        self.feature_size = config.feature_size 
-        self.batch_size = config.batch_size 
-        self.data_max_text_len = config.data_max_text_len 
-        self.blstm_layer_num = config.blstm_layer_num 
-        self.output_layer = config.output_layer 
-        # BiGRU Encoder configuration (replacing CondGCNN Block × M)
-        self.bigru_layer_num = getattr(config, 'bigru_layer_num', 3)
-        self.bigru_encoder = nn.GRU(
-            input_size=config.feature_size,
-            hidden_size=out_channel,
-            num_layers=self.bigru_layer_num,
-            batch_first=True,
-            dropout=config.lstm_dropout_rate,
-            bidirectional=True,
-        )
-        # Project bidirectional output (2*out_channel) back to out_channel
-        self.bigru_proj = nn.Linear(out_channel * 2, out_channel)
+        fused = fused.masked_fill(pad_mask, 0).transpose(1, 2)
+        head_features = self.aspp(fused) if self.aspp is not None else fused
+        logits = self.classifier(self.output_dropout(head_features))
+        logits = logits.masked_fill(~valid_mask.unsqueeze(1), 0)
+        return F.pad(logits, (0, input_length - length))
 
-    def init_hidden(self, batch_size):
-        return (torch.zeros(self.blstm_layer_num * 2, batch_size,
-                            self.lstm_hidden_size).to(self.device),
-                torch.zeros(self.blstm_layer_num * 2, batch_size,
-                            self.lstm_hidden_size).to(self.device))
-
-    def forward(self, seq):
-        # seq:(batch,seq_len)
-        batch_size = seq.size(0)
-        seq_len = seq.size(1)
-        # x = self.embedding(seq)  # x: (batch,seq_len,embed_dim)
-        # x.transpose_(1, 2)  # x:(batch,embed_dim,seq_len) , embed_dim equals to in_channel
-        # Replace CondGCNN Block × M with BiGRU Encoder
-        x = seq  # [batch, feature_size, seq_len]
-        # BiGRU expects [batch, seq_len, feature_size]
-        bigru_in = x.permute(0, 2, 1)
-        bigru_out, _ = self.bigru_encoder(bigru_in)  # [batch, seq_len, 2*out_channel]
-        bigru_out = self.bigru_proj(bigru_out)       # [batch, seq_len, out_channel]
-        h = bigru_out.permute(0, 2, 1)               # [batch, out_channel, seq_len]
-
-        x = seq
-        x = x.permute(0, 2, 1)  # [batch, seq_len, feature_size]
-        
-        bilstm_in = self.input_projection(x)  # [batch, seq_len, hidden]
-        h_l = bilstm_in
-        for i, lstm in enumerate(self.bilstm_layers):
-            out, (hidden_state, cell_state) = lstm(h_l)
-            out = self.layer_norms[i](out)
-            out = F.dropout(out, p=self.bilstm_dropout, training=self.training)
-            h_l = out
-        attended_h, _ = self.attention(h_l, h_l, h_l)
-        bilstm_out = self.output_projection(attended_h + h_l)  # [batch, seq_len, 2*hidden]
-        bilstm_out = bilstm_out.permute(0, 2, 1)
-        backbone_out = torch.cat((h, bilstm_out), 1)
-
-        # [32,X,700]
-        for index, conv in enumerate(self.convs_aspp):
-            out_each = conv(backbone_out)
-            if index == 0:
-                out = out_each
-            else:
-                out = torch.cat((out, out_each), 1)
-        out = torch.cat((out, backbone_out), 1)
-
-        if self.output_layer == 'conv1':
-            logic = self.conv_1(out)
-        elif self.output_layer == 'convtop':
-            logic = self.conv_top(out)
-
-        # if self.conv_end:
-        #     logic = self.conv_top(h)
-        # else:
-        #     h.transpose_(1, 2)  # h:(batch,seq_len,out_channel)
-
-        #     logic = self.fc(h)  # logic:(batch,seq_len,vocab_size)
-        #     logic.transpose_(
-        #         1, 2
-        #     )  # logic:(batch,vocab_size,seq_len) cross_entropy input:(N,C,d1,d2,..) C is num of class
-        return logic
+    def predict_proba(self, seq, valid_mask=None):
+        """Return Q8 probabilities for valid residues in DSSP class order."""
+        valid_mask = self._resolve_mask(seq, valid_mask)
+        logits = self(seq, valid_mask)[:, :PAD_LABEL]
+        return F.softmax(logits, dim=1).masked_fill(~valid_mask.unsqueeze(1), 0)
 
 
 class CondConv1D(_ConvNd):

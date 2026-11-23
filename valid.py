@@ -1,74 +1,106 @@
-import os
+from collections import namedtuple
+from pathlib import Path
+
 import numpy as np
 import torch
 
-seq_list = ['A', 'C', 'E', 'D', 'G', 'F', 'I', 'H', 'K', 'M',
-            'L', 'N', 'Q', 'P', 'S', 'R', 'T', 'W', 'V', 'Y', 'X', '']
+from loaddata import AA_ALPHABET, PAD_LABEL, Q8_STATES
 
-def acc(pred_list, label_list, ignore_cls=8):
-    total = 0
-    correct = 0
 
-    edge_total = 0
-    edge_correct = 0
-    for pred_sub, label_sub in zip(pred_list, label_list):
-        for idx, (p, l) in enumerate(zip(pred_sub, label_sub)):
-            if l != torch.tensor(ignore_cls).to('cuda'):
-                if idx == 0 or idx == len(label_sub)-1:
-                    if p == l:
-                        edge_correct += 1
-                    edge_total += 1
-                elif l != label_sub[idx-1] or l != label_sub[idx+1]:
-                    if p == l:
-                        edge_correct += 1
-                    edge_total += 1
+Evaluation = namedtuple(
+    'Evaluation', 'q8 q3 edge_q8 protein_q8 protein_q8_std protein_edge_q8 protein_edge_q8_std'
+)
 
-                if p == l:
-                    correct += 1
-                total += 1
-    return correct / total, edge_correct / edge_total
+
+def edge_mask(labels, valid):
+    edges = torch.zeros_like(valid)
+    edges[:, 0] = True
+    edges[:, -1] = True
+    transitions = (labels[:, 1:] != labels[:, :-1]) | (valid[:, 1:] != valid[:, :-1])
+    edges[:, :-1] |= transitions
+    edges[:, 1:] |= transitions
+    return edges & valid
+
+
+def acc(pred_list, label_list, ignore_cls=PAD_LABEL):
+    valid = label_list.ne(ignore_cls)
+    edges = edge_mask(label_list, valid)
+    hits = pred_list.eq(label_list)
+    return ((hits & valid).sum().item() / max(valid.sum().item(), 1),
+            (hits & edges).sum().item() / max(edges.sum().item(), 1))
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, save_path=None, channel_first=False):
+    model.eval()
+    q3_classes = dict(C=0, S=0, T=0, E=1, B=1, H=2, G=2, I=2)
+    q3_map = torch.tensor([q3_classes[state] for state in Q8_STATES] + [3], device=device)
+    protein_q8 = []
+    protein_edge_q8 = []
+    records = []
+    residue_count = q8_correct = q3_correct = edge_count = edge_correct = 0
+
+    for features, labels in loader:
+        features = features if channel_first else features.transpose(1, 2)
+        labels = labels.to(device)
+        valid = labels.ne(PAD_LABEL)
+        logits = model(features.to(device), valid)
+        predictions = logits[:, :len(Q8_STATES)].argmax(dim=1)
+        hits = predictions.eq(labels)
+        edges = edge_mask(labels, valid)
+        counts = torch.stack((
+            valid.sum(dim=1),
+            (hits & valid).sum(dim=1),
+            (q3_map[predictions].eq(q3_map[labels]) & valid).sum(dim=1),
+            edges.sum(dim=1),
+            (hits & edges).sum(dim=1),
+        ), dim=1).tolist()
+        if save_path is not None:
+            residues = features[:, -len(AA_ALPHABET):, :]
+            identity = residues.argmax(dim=1).tolist()
+            present = residues.ne(0).any(dim=1).tolist()
+
+        for i, (length, correct, correct_q3, n_edges, correct_edges) in enumerate(counts):
+            if length == 0:
+                continue
+            residue_count += length
+            q8_correct += correct
+            q3_correct += correct_q3
+            edge_count += n_edges
+            edge_correct += correct_edges
+            score = correct / length
+            protein_q8.append(score)
+            protein_edge_q8.append(correct_edges / n_edges)
+            if save_path is not None:
+                seq = ''.join(AA_ALPHABET[index] for index, is_present in
+                              zip(identity[i], present[i]) if is_present)
+                records.append((seq, score))
+
+    if residue_count == 0:
+        raise ValueError('Evaluation requires at least one labeled residue.')
+    if save_path is not None:
+        with Path(save_path).open('w', encoding='utf-8') as output:
+            for sequence, score in records:
+                output.write('{},{}\n'.format(sequence, score))
+
+    return Evaluation(
+        q8_correct / residue_count,
+        q3_correct / residue_count,
+        edge_correct / edge_count,
+        np.mean(protein_q8),
+        np.std(protein_q8),
+        np.mean(protein_edge_q8),
+        np.std(protein_edge_q8),
+    )
+
 
 def get_valid_acc(config, model, valid_loader, epoch, test_mark, save_acc=True):
-    model.eval()
-    
-    count = 0
-    acc_valid_sum = 0
-    edge_acc_sum = 0
-    dict_epoch = {}
-
-    value_acc_list = []
-    value_edge_acc_list = []
-
-    for x, labels in valid_loader:
-        outputs_val = model(x.to('cuda'))
-        prediction = torch.argmax(outputs_val, 1)
-        value_acc, value_edge_acc = acc(prediction, labels.to('cuda'), ignore_cls=config.class_num-1)
-        value_acc_list.append(value_acc)
-        value_edge_acc_list.append(value_edge_acc)
-        acc_valid_sum += value_acc
-        edge_acc_sum += value_edge_acc
-        count += 1
-
-        if save_acc:
-            key_x = x[0].permute(1, 0)
-            dict_epoch[key_x] = value_acc  
-
+    save_path = None
     if save_acc:
-        save_acc_path = os.path.join(config.save_acc_fpath,
-                                    'acc_{}_Epoch{}_{}.acc'.format(test_mark, epoch + 1, config.model))
-
-        with open(save_acc_path, 'w') as w:
-            for key in dict_epoch:
-                seq = ''
-                for line in key:
-                    for idx, item in enumerate(line[:21]):
-                        if item == 1:
-                            char = seq_list[idx]
-                            seq += char
-                            char = ''
-                            break
-                w.write('{},{}\n'.format(seq, dict_epoch[key]))
-                seq = ''
-
-    # return acc_valid_sum / count, edge_acc_sum / count
-    return np.mean(value_acc_list), np.mean(value_edge_acc_list), np.std(value_acc_list), np.std(value_edge_acc_list)
+        filename = 'acc_{}_Epoch{}_{}.acc'.format(test_mark, epoch + 1, config.model)
+        save_path = Path(config.save_acc_fpath) / filename
+    results = evaluate(
+        model, valid_loader, config.device, save_path, channel_first=True
+    )
+    return (results.protein_q8, results.protein_edge_q8, results.protein_q8_std,
+            results.protein_edge_q8_std)
